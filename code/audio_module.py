@@ -7,6 +7,7 @@ import time
 from collections import namedtuple
 from queue import Queue
 from typing import Callable, Generator, Optional
+import wave
 
 import numpy as np
 from huggingface_hub import hf_hub_download
@@ -583,3 +584,11 @@ class AudioProcessor:
 
         logger.info(f"👄✅ {generation_string} Final answer synthesis complete.")
         return True # Indicate successful completion
+
+    def synthesize_short_utterance(self, text: str, audio_chunks: Queue, stop_event: threading.Event) -> bool:
+        """Simplified wrapper for quick synthesis of short text."""
+        return self.synthesize(text, audio_chunks, stop_event, generation_string="[ShortTTS]")
+
+    def play_pre_recorded_snippet(self, method_name: str) -> None:
+        """Log playback of a pre-recorded snippet (placeholder implementation)."""
+        logger.info(f"👄📢 Would play pre-recorded snippet: {method_name}")

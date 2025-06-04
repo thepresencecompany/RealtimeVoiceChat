@@ -1060,7 +1060,7 @@ class SpeechPipelineManager:
         """Generate short TTS audio for listener feedback text."""
         local_queue: Queue = Queue()
         stop_event = threading.Event()
-        self.audio.synthesize(text, local_queue, stop_event, generation_string="[ListenerFeedback]")
+        self.audio.synthesize_short_utterance(text, local_queue, stop_event)
 
         chunks: list[bytes] = []
         while not local_queue.empty():
@@ -1069,6 +1069,13 @@ class SpeechPipelineManager:
             except Empty:
                 break
         return chunks
+
+    def play_voice_snippet(self, method_name: str) -> None:
+        """Request playback of a pre-recorded voice snippet."""
+        try:
+            self.audio.play_pre_recorded_snippet(method_name)
+        except Exception as e:
+            logger.error(f"Error playing voice snippet '{method_name}': {e}")
 
     def shutdown(self):
         """
