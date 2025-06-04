@@ -19,6 +19,7 @@ import threading # Keep threading for SpeechPipelineManager internals and AbortW
 import sys
 import os # Added for environment variable access
 import random
+import aiohttp
 
 from typing import Any, Dict, Optional, Callable # Added for type hints in docstrings
 from contextlib import asynccontextmanager
@@ -42,6 +43,9 @@ LLM_START_MODEL = "hf.co/bartowski/huihui-ai_Mistral-Small-24B-Instruct-2501-abl
 # LLM_START_MODEL = "Qwen3-30B-A3B-GGUF/Qwen3-30B-A3B-Q3_K_L.gguf"
 NO_THINK = False
 DIRECT_STREAM = TTS_START_ENGINE=="orpheus"
+
+# Endpoint for the local listener feedback LLM
+LOCAL_LISTENER_LLM_URL = os.getenv("LOCAL_LISTENER_LLM_URL", "http://localhost:9000/generate_listener_feedback")
 
 if __name__ == "__main__":
     logger.info(f"🖥️⚙️ {Colors.apply('[PARAM]').blue} Starting engine: {Colors.apply(TTS_START_ENGINE).blue}")
@@ -229,19 +233,21 @@ def format_timestamp_ns(timestamp_ns: int) -> str:
 # --------------------------------------------------------------------
 # Listener feedback helpers
 # --------------------------------------------------------------------
-async def call_local_listener_llm(text: str, previous_state: Optional[dict] = None) -> dict:
-    """Placeholder call to a local LLM returning animation and text cues."""
-    await asyncio.sleep(0)  # simulate async
-    responses = [
-        {"animation_idle_state": None, "animation_active_state": "nod_head", "text": "uh-huh", "voice_method": None},
-        {"animation_idle_state": "neutral_idle", "animation_active_state": None, "text": None, "voice_method": None},
-        {"animation_idle_state": None, "animation_active_state": "smile", "text": "I see", "voice_method": None},
-    ]
-    return random.choice(responses)
+async def call_local_listener_llm(text: str, previous_state: Optional[dict] = None) -> Optional[dict]:
+    """Call the local listener feedback LLM via HTTP."""
+    payload = {"stt_text": text, "previous_state": previous_state}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(LOCAL_LISTENER_LLM_URL, json=payload, timeout=0.4) as response:
+                if response.status == 200:
+                    return await response.json()
+                logger.error(f"Local LLM error: {response.status} - {await response.text()}")
+    except Exception as e:
+        logger.error(f"Error calling local LLM: {e}")
+    return None
 
 async def listener_feedback_loop(app: FastAPI, callbacks: 'TranscriptionCallbacks', message_queue: asyncio.Queue) -> None:
     """Send partial STT to local LLM every 500ms and handle its response."""
-    previous_state = None
     while True:
         await asyncio.sleep(0.5)
         if not callbacks.listener_active:
@@ -250,17 +256,20 @@ async def listener_feedback_loop(app: FastAPI, callbacks: 'TranscriptionCallback
         if not text:
             continue
         try:
-            response = await call_local_listener_llm(text, previous_state)
-            previous_state = response
+            response = await call_local_listener_llm(text, callbacks.last_local_llm_json_response)
+            if response:
+                callbacks.last_local_llm_json_response = response
         except Exception as e:
             logger.error(f"Listener LLM error: {e}")
             continue
-        if response.get("animation_idle_state"):
-            print(f"ANIMATION IDLE: {response['animation_idle_state']}")
-        if response.get("animation_active_state"):
-            print(f"ANIMATION ACTIVE: {response['animation_active_state']}")
+        if not response:
+            continue
+        anim_idle = response.get("animation_idle_state")
+        anim_active = response.get("animation_active_state")
+        if anim_idle or anim_active:
+            message_queue.put_nowait({"type": "animation_update", "idle": anim_idle, "active": anim_active})
         if response.get("voice_method"):
-            print(f"VOICE METHOD: {response['voice_method']}")
+            await asyncio.to_thread(app.state.SpeechPipelineManager.play_voice_snippet, response["voice_method"])
         if response.get("text"):
             chunks = await asyncio.to_thread(app.state.SpeechPipelineManager.process_listener_feedback_tts, response["text"])
             for c in chunks:
@@ -607,6 +616,9 @@ class TranscriptionCallbacks:
         self.listener_buffer: str = ""
         self._last_partial_for_buffer: str = ""
 
+        # Last JSON response from local listener LLM
+        self.last_local_llm_json_response: Optional[dict] = None
+
         self.reset_state() # Call reset to ensure consistency
 
         self.abort_request_event = threading.Event()
@@ -639,6 +651,7 @@ class TranscriptionCallbacks:
         self.listener_active = False
         self.listener_buffer = ""
         self._last_partial_for_buffer = ""
+        self.last_local_llm_json_response = None
 
         # Keep the abort call related to the audio processor/pipeline manager
         self.app.state.AudioInputProcessor.abort_generation()
