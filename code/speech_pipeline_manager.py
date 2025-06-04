@@ -1056,6 +1056,20 @@ class SpeechPipelineManager:
         self.history = []
         logger.info("🗣️🧹 History cleared. Reset complete.")
 
+    def process_listener_feedback_tts(self, text: str) -> list[bytes]:
+        """Generate short TTS audio for listener feedback text."""
+        local_queue: Queue = Queue()
+        stop_event = threading.Event()
+        self.audio.synthesize(text, local_queue, stop_event, generation_string="[ListenerFeedback]")
+
+        chunks: list[bytes] = []
+        while not local_queue.empty():
+            try:
+                chunks.append(local_queue.get_nowait())
+            except Empty:
+                break
+        return chunks
+
     def shutdown(self):
         """
         Initiates a graceful shutdown of the pipeline manager and worker threads.

@@ -18,6 +18,7 @@ import time
 import threading # Keep threading for SpeechPipelineManager internals and AbortWorker
 import sys
 import os # Added for environment variable access
+import random
 
 from typing import Any, Dict, Optional, Callable # Added for type hints in docstrings
 from contextlib import asynccontextmanager
@@ -224,6 +225,49 @@ def format_timestamp_ns(timestamp_ns: int) -> str:
     formatted_timestamp = f"{time_str}.{milliseconds:03d}"
 
     return formatted_timestamp
+
+# --------------------------------------------------------------------
+# Listener feedback helpers
+# --------------------------------------------------------------------
+async def call_local_listener_llm(text: str, previous_state: Optional[dict] = None) -> dict:
+    """Placeholder call to a local LLM returning animation and text cues."""
+    await asyncio.sleep(0)  # simulate async
+    responses = [
+        {"animation_idle_state": None, "animation_active_state": "nod_head", "text": "uh-huh", "voice_method": None},
+        {"animation_idle_state": "neutral_idle", "animation_active_state": None, "text": None, "voice_method": None},
+        {"animation_idle_state": None, "animation_active_state": "smile", "text": "I see", "voice_method": None},
+    ]
+    return random.choice(responses)
+
+async def listener_feedback_loop(app: FastAPI, callbacks: 'TranscriptionCallbacks', message_queue: asyncio.Queue) -> None:
+    """Send partial STT to local LLM every 500ms and handle its response."""
+    previous_state = None
+    while True:
+        await asyncio.sleep(0.5)
+        if not callbacks.listener_active:
+            continue
+        text = callbacks.listener_buffer.strip()
+        if not text:
+            continue
+        try:
+            response = await call_local_listener_llm(text, previous_state)
+            previous_state = response
+        except Exception as e:
+            logger.error(f"Listener LLM error: {e}")
+            continue
+        if response.get("animation_idle_state"):
+            print(f"ANIMATION IDLE: {response['animation_idle_state']}")
+        if response.get("animation_active_state"):
+            print(f"ANIMATION ACTIVE: {response['animation_active_state']}")
+        if response.get("voice_method"):
+            print(f"VOICE METHOD: {response['voice_method']}")
+        if response.get("text"):
+            chunks = await asyncio.to_thread(app.state.SpeechPipelineManager.process_listener_feedback_tts, response["text"])
+            for c in chunks:
+                base64_chunk = app.state.Upsampler.get_base64_chunk(c)
+                message_queue.put_nowait({"type": "tts_chunk", "content": base64_chunk})
+        if any(p in text for p in [".", "!", "?"]):
+            callbacks.listener_buffer = ""
 
 # --------------------------------------------------------------------
 # WebSocket data processing
@@ -558,6 +602,11 @@ class TranscriptionCallbacks:
         self.final_assistant_answer_sent: bool = False
         self.partial_transcription: str = "" # Added for clarity
 
+        # Listener feedback state
+        self.listener_active: bool = False
+        self.listener_buffer: str = ""
+        self._last_partial_for_buffer: str = ""
+
         self.reset_state() # Call reset to ensure consistency
 
         self.abort_request_event = threading.Event()
@@ -586,6 +635,10 @@ class TranscriptionCallbacks:
         self.last_inferred_transcription = ""
         self.final_assistant_answer_sent = False
         self.partial_transcription = ""
+
+        self.listener_active = False
+        self.listener_buffer = ""
+        self._last_partial_for_buffer = ""
 
         # Keep the abort call related to the audio processor/pipeline manager
         self.app.state.AudioInputProcessor.abort_generation()
@@ -619,6 +672,13 @@ class TranscriptionCallbacks:
         self.message_queue.put_nowait({"type": "partial_user_request", "content": txt})
         self.abort_text = txt # Update text used for abort check
         self.abort_request_event.set() # Signal the abort worker
+
+        if txt.startswith(self._last_partial_for_buffer):
+            addition = txt[len(self._last_partial_for_buffer):]
+        else:
+            addition = txt
+        self.listener_buffer += addition
+        self._last_partial_for_buffer = txt
 
     def safe_abort_running_syntheses(self, reason: str):
         """Placeholder for safely aborting syntheses (currently does nothing)."""
@@ -676,6 +736,7 @@ class TranscriptionCallbacks:
         logger.info(Colors.apply('🖥️🏁 =================== USER TURN END ===================').light_gray)
         self.user_finished_turn = True
         self.user_interrupted = False # Reset connection-specific flag (user finished, not interrupted)
+        self.listener_active = False
         # Access global manager state
         if self.app.state.SpeechPipelineManager.is_valid_gen():
             logger.info(f"{Colors.apply('🖥️🔊 TTS ALLOWED (before final)').blue}")
@@ -780,6 +841,9 @@ class TranscriptionCallbacks:
         generation, sends any final assistant answer generated so far, and resets relevant state.
         """
         logger.info(f"{Colors.ORANGE}🖥️🎙️ Recording started.{Colors.RESET} TTS Client Playing: {self.tts_client_playing}")
+        self.listener_active = True
+        self.listener_buffer = ""
+        self._last_partial_for_buffer = ""
         # Use connection-specific tts_client_playing flag
         if self.tts_client_playing:
             self.tts_to_client = False # Stop server sending TTS
@@ -914,6 +978,7 @@ async def websocket_endpoint(ws: WebSocket):
         asyncio.create_task(app.state.AudioInputProcessor.process_chunk_queue(audio_chunks)),
         asyncio.create_task(send_text_messages(ws, message_queue)),
         asyncio.create_task(send_tts_chunks(app, message_queue, callbacks)), # Pass callbacks
+        asyncio.create_task(listener_feedback_loop(app, callbacks, message_queue)),
     ]
 
     try:
